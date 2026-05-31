@@ -1,0 +1,151 @@
+---
+- name: Upgrade Zabbix Agent 1 to Zabbix Agent 2 (Portable ZIP Edition)
+  hosts: windows
+  gather_facts: yes
+  vars:
+    # Name of the Windows service for Zabbix Agent 1 to query
+    zabbix_agent1_query_service_name: "zabbix_agentd"
+
+    # --- Fallback paths if Zabbix Agent 1 service properties cannot be determined ---
+    zabbix_agent1_fallback_dir: "c:\\tools\\zabbix_agent_x.x"
+    zabbix_agent1_fallback_conf: "{{ zabbix_agent1_fallback_dir }}\\conf\\zabbix_agentd.conf"
+    zabbix_agent1_fallback_bin: "{{ zabbix_agent1_fallback_dir }}\\bin\\zabbix_agentd.exe"
+
+    # --- Paths for Zabbix Agent 2 (New) ---
+    zabbix_agent2_dir: "c:\\tools\\zabbix_agent2"
+    zabbix_agent2_conf_path: "{{ zabbix_agent2_dir }}\\conf\\zabbix_agent2.conf"
+    zabbix_agent2_bin_path: "{{ zabbix_agent2_dir }}\\bin\\zabbix_agent2.exe"
+    zabbix_agent2_service_name: "Zabbix Agent 2"
+
+    # --- Temp directory for installation ---
+    win_temp_dir: "C:\\Windows\\Temp"
+    zabbix_temp_conf: "{{ win_temp_dir }}\\zabbix_agent2_temp.conf"
+    zabbix_temp_zip: "{{ win_temp_dir }}\\zabbix_agent2.zip"
+
+  tasks:
+    - name: 1. Verify that required variables are defined
+      ansible.builtin.fail:
+        msg: "The variable '{{ item.name }}' is not defined. Please define it in your inventory or vars."
+      when: item.val is undefined or item.val == ""
+      loop:
+        - { name: 'zabbix_server', val: "{{ zabbix_server | default('') }}" }
+        - { name: 'zabbix_win_installer', val: "{{ zabbix_win_installer | default('') }}" }
+
+    - name: 2. Query old Zabbix Agent 1 service status
+      ansible.windows.win_service_info:
+        name: "{{ zabbix_agent1_query_service_name }}"
+      register: old_service_info
+
+    - name: 3. Query new Zabbix Agent 2 service status
+      ansible.windows.win_service_info:
+        name: "{{ zabbix_agent2_service_name }}"
+      register: new_service_info
+
+    - name: 4. Set fact variables for migration states
+      ansible.builtin.set_fact:
+        old_service_exists: "{{ old_service_info.services | length > 0 }}"
+        new_service_exists: "{{ new_service_info.services | length > 0 }}"
+
+    - name: 5. Fail if neither old nor new service exists
+      ansible.builtin.fail:
+        msg: "Neither the old Zabbix Agent service ({{ zabbix_agent1_query_service_name }}) nor the new Zabbix Agent 2 service ({{ zabbix_agent2_service_name }}) was found. Please ensure this host has Zabbix Agent 1 installed."
+      when: not old_service_exists and not new_service_exists
+
+    - name: 6. Parse and set dynamic variables for old Zabbix Agent
+      ansible.builtin.set_fact:
+        zabbix_agent1_service_name: "{{ old_service_info.services[0].name }}"
+        # Extract binary path: if quoted, extract the inside; otherwise, take everything before the first space
+        zabbix_agent1_bin_path: "{{ (old_service_info.services[0].path.startswith('\"')) | ternary(old_service_info.services[0].path | regex_search('^\"([^\"]+)\"', '\\1'), old_service_info.services[0].path.split()[0]) }}"
+        # Extract configuration file path from the service start command arguments
+        zabbix_agent1_conf_path: "{{ old_service_info.services[0].path | regex_search('(?:--config|-c|-config)\\s+[\"\\\'\\\"\\\'\\s]?([^\"\\\'\\\"\\\']+)', '\\1') | default(zabbix_agent1_fallback_conf, true) }}"
+      when: old_service_exists
+
+    - name: 7. Check if old Zabbix Agent 1 configuration file exists
+      ansible.windows.win_stat:
+        path: "{{ zabbix_agent1_conf_path }}"
+      register: old_conf_stat
+      when: old_service_exists
+
+    - name: Fail if old configuration file is missing
+      ansible.builtin.fail:
+        msg: "Old configuration file not found at: {{ zabbix_agent1_conf_path }}. Cannot proceed with migration."
+      when: old_service_exists and not old_conf_stat.stat.exists
+
+    - name: 8. Backup old config file to a safe temp location
+      ansible.windows.win_copy:
+        src: "{{ zabbix_agent1_conf_path }}"
+        dest: "{{ zabbix_temp_conf }}"
+        remote_src: yes
+      when: old_service_exists
+
+    - name: 9. Stop the old Zabbix Agent 1 service
+      ansible.windows.win_service:
+        name: "{{ zabbix_agent1_service_name }}"
+        state: stopped
+      when: old_service_exists
+
+    - name: 10. Uninstall the old Zabbix Agent 1 service
+      ansible.windows.win_command:
+        cmd: '"{{ zabbix_agent1_bin_path }}" --config "{{ zabbix_agent1_conf_path }}" --uninstall'
+      when: old_service_exists
+      register: uninstall_result
+      changed_when: "'uninstalled' in uninstall_result.stdout or uninstall_result.rc == 0"
+
+    - name: 11. Create target directory for Zabbix Agent 2
+      ansible.windows.win_file:
+        path: "{{ zabbix_agent2_dir }}"
+        state: directory
+      when: not new_service_exists
+
+    - name: 12. Transfer Zabbix Agent 2 portable zip from Ansible controller
+      ansible.windows.win_copy:
+        src: "{{ zabbix_win_installer }}"
+        dest: "{{ zabbix_temp_zip }}"
+      when: not new_service_exists
+
+    - name: 13. Extract Zabbix Agent 2 ZIP archive
+      community.windows.win_unzip:
+        src: "{{ zabbix_temp_zip }}"
+        dest: "{{ zabbix_agent2_dir }}"
+        delete_archive: yes
+      when: not new_service_exists
+
+    - name: 14. Copy backup configuration to new Zabbix Agent 2 config location
+      ansible.windows.win_copy:
+        src: "{{ zabbix_temp_conf }}"
+        dest: "{{ zabbix_agent2_conf_path }}"
+        remote_src: yes
+      when: old_service_exists
+
+    - name: 15. Configure Server and ServerActive in zabbix_agent2.conf (Idempotent)
+      community.windows.win_lineinfile:
+        path: "{{ zabbix_agent2_conf_path }}"
+        regexp: '^Server='
+        line: 'Server={{ zabbix_server }}'
+      register: server_config_update
+
+    - name: Configure ServerActive in zabbix_agent2.conf (Idempotent)
+      community.windows.win_lineinfile:
+        path: "{{ zabbix_agent2_conf_path }}"
+        regexp: '^ServerActive='
+        line: 'ServerActive={{ zabbix_server }}'
+      register: server_active_config_update
+
+    - name: 16. Register Zabbix Agent 2 service
+      ansible.windows.win_command:
+        cmd: '"{{ zabbix_agent2_bin_path }}" --config "{{ zabbix_agent2_conf_path }}" --install'
+      when: not new_service_exists
+      register: install_result
+      changed_when: "'installed' in install_result.stdout or install_result.rc == 0"
+
+    - name: 17. Start and enable Zabbix Agent 2 service (Idempotent)
+      ansible.windows.win_service:
+        name: "{{ zabbix_agent2_service_name }}"
+        state: started
+        start_mode: auto
+
+    - name: 18. Clean up temporary backup files on Windows host
+      ansible.windows.win_file:
+        path: "{{ zabbix_temp_conf }}"
+        state: absent
+      when: old_service_exists
